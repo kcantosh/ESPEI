@@ -208,9 +208,9 @@ def lnprob(params, comps=None, dbf=None, phases=None, datasets=None,
     try:
         iter_error = multi_phase_fit(dbf, comps, phases, datasets, phase_models,
                                      parameters=parameters, scheduler=scheduler,
-                                     phase_obj_callables=phase_obj_callables,
-                                     phase_grad_callables=phase_grad_callables,
-                                     phase_hess_callables=phase_hess_callables,
+                                     obj_callables=phase_obj_callables,
+                                     grad_callables=phase_grad_callables,
+                                     hess_callables=phase_hess_callables,
                                      )
     except (ValueError, LinAlgError) as e:
         iter_error = [np.inf]
