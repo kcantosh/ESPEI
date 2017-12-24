@@ -285,14 +285,13 @@ def build_phase_models(dbf, comps, phases, symbols_to_fit, model):
         hess_funcs = dict()
         for phase_name in phases:
             mod = Model(dbf, comps, phase_name)
-            obj, grad, hess = compiled_build_functions(mod.GM, [v.P, v.T] + mod.site_fractions,
+            obj, grad = compiled_build_functions(mod.GM, [v.P, v.T] + mod.site_fractions,
                                                        wrt=[v.P, v.T] + mod.site_fractions,
                                                        parameters=[sympy.Symbol(s) for s in symbols_to_fit])
             phase_models[phase_name] = mod
             obj_funcs[phase_name] = obj
             grad_funcs[phase_name] = grad
-            hess_funcs[phase_name] = hess
-        return phase_models, obj_funcs, grad_funcs, hess_funcs
+        return phase_models, obj_funcs, grad_funcs, None
 
 
 
