@@ -8,13 +8,15 @@ import sympy
 import numpy as np
 import tinydb
 from numpy.linalg import LinAlgError
-from pycalphad import calculate, equilibrium, CompiledModel, variables as v
+from pycalphad import calculate, equilibrium, Model, CompiledModel, variables as v
+from pycalphad.core.sympydiff_utils import build_functions as compiled_build_functions
 import emcee
 
 from espei.utils import database_symbols_to_fit, optimal_parameters
 
 
-def estimate_hyperplane(dbf, comps, phases, current_statevars, comp_dicts, phase_models, parameters):
+def estimate_hyperplane(dbf, comps, phases, current_statevars, comp_dicts, phase_models, parameters,
+                        phase_obj_callables, phase_grad_callables, phase_hess_callables,):
     region_chemical_potentials = []
     parameters = OrderedDict(sorted(parameters.items(), key=str))
     for cond_dict, phase_flag in comp_dicts:
@@ -30,7 +32,11 @@ def estimate_hyperplane(dbf, comps, phases, current_statevars, comp_dicts, phase
             # Extract chemical potential hyperplane from multi-phase calculation
             # Note that we consider all phases in the system, not just ones in this tie region
             multi_eqdata = equilibrium(dbf, comps, phases, cond_dict, verbose=False,
-                                       model=phase_models, scheduler=dask.local.get_sync, parameters=parameters)
+                                       model=phase_models, scheduler=dask.local.get_sync, parameters=parameters,
+                                       phase_obj_callables=phase_obj_callables,
+                                       phase_grad_callables=phase_grad_callables,
+                                       phase_hess_callables=phase_hess_callables,
+                                       )
             # Does there exist only a single phase in the result with zero internal degrees of freedom?
             # We should exclude those chemical potentials from the average because they are meaningless.
             num_phases = len(np.squeeze(multi_eqdata['Phase'].values != ''))
@@ -44,12 +50,12 @@ def estimate_hyperplane(dbf, comps, phases, current_statevars, comp_dicts, phase
 
 
 def tieline_error(dbf, comps, current_phase, cond_dict, region_chemical_potentials, phase_flag,
-                  phase_models, parameters, debug_mode=False):
+                  phase_models, parameters, phase_obj_callables, phase_grad_callables, phase_hess_callables, debug_mode=False):
     if np.any(np.isnan(list(cond_dict.values()))):
         # We don't actually know the phase composition here, so we estimate it
         single_eqdata = calculate(dbf, comps, [current_phase],
                                   T=cond_dict[v.T], P=cond_dict[v.P],
-                                  model=phase_models, parameters=parameters, pdens=100)
+                                  model=phase_models, parameters=parameters, pdens=100, callables=phase_obj_callables)
         driving_force = np.multiply(region_chemical_potentials,
                                     single_eqdata['X'].values).sum(axis=-1) - single_eqdata['GM'].values
         error = float(driving_force.max())
@@ -74,7 +80,7 @@ def tieline_error(dbf, comps, current_phase, cond_dict, region_chemical_potentia
             dof_idx += len(dof)
         single_eqdata = calculate(dbf, comps, [current_phase],
                                   T=cond_dict[v.T], P=cond_dict[v.P], points=desired_sitefracs,
-                                  model=phase_models, parameters=parameters)
+                                  model=phase_models, parameters=parameters, callables=phase_obj_callables)
         driving_force = np.multiply(region_chemical_potentials,
                                     single_eqdata['X'].values).sum(axis=-1) - single_eqdata['GM'].values
         error = float(np.squeeze(driving_force))
@@ -82,7 +88,8 @@ def tieline_error(dbf, comps, current_phase, cond_dict, region_chemical_potentia
         # Extract energies from single-phase calculations
         single_eqdata = equilibrium(dbf, comps, [current_phase], cond_dict, verbose=False,
                                     model=phase_models,
-                                    scheduler=dask.local.get_sync, parameters=parameters)
+                                    scheduler=dask.local.get_sync, parameters=parameters,
+                                    callables=phase_obj_callables, grad_callables=phase_grad_callables, hess_callables=phase_hess_callables,)
         if np.all(np.isnan(single_eqdata['NP'].values)):
             error_time = time.time()
             template_error = """
@@ -118,7 +125,12 @@ def tieline_error(dbf, comps, current_phase, cond_dict, region_chemical_potentia
     return error
 
 
-def multi_phase_fit(dbf, comps, phases, datasets, phase_models, parameters=None, scheduler=None):
+def multi_phase_fit(dbf, comps, phases, datasets, phase_models, parameters=None, scheduler=None,
+                    obj_callables=None, grad_callables=None, hess_callables=None,):
+    obj_callables = obj_callables if obj_callables is not None else defaultdict(lambda: None)
+    grad_callables = grad_callables if grad_callables is not None else defaultdict(lambda: None)
+    hess_callables = hess_callables if hess_callables is not None else defaultdict(lambda: None)
+
     scheduler = scheduler or dask.local
     # TODO: support distributed schedulers for multi_phase_fit.
     # This can be done if the scheduler passed is a distributed.worker_client
@@ -163,7 +175,10 @@ def multi_phase_fit(dbf, comps, phases, datasets, phase_models, parameters=None,
                 current_statevars, comp_dicts = req
                 region_chemical_potentials = \
                     dask.delayed(estimate_hyperplane)(dbf, data_comps, phases, current_statevars, comp_dicts,
-                                                      phase_models, parameters)
+                                                      phase_models, parameters,
+                                                      obj_callables,
+                                                      grad_callables,
+                                                      hess_callables,)
                 # Now perform the equilibrium calculation for the isolated phases and add the result to the error record
                 for current_phase, cond_dict in zip(region, comp_dicts):
                     # TODO: Messy unpacking
@@ -174,21 +189,29 @@ def multi_phase_fit(dbf, comps, phases, datasets, phase_models, parameters=None,
                             cond_dict[key] = np.nan
                     cond_dict.update(current_statevars)
                     error = dask.delayed(tieline_error)(dbf, data_comps, current_phase, cond_dict, region_chemical_potentials, phase_flag,
-                                                        phase_models, parameters)
+                                                        phase_models, parameters,
+                                                        obj_callables, grad_callables, hess_callables,)
                     fit_jobs.append(error)
     errors = dask.compute(*fit_jobs, get=scheduler.get_sync)
     return errors
 
 
 def lnprob(params, comps=None, dbf=None, phases=None, datasets=None,
-           symbols_to_fit=None, phase_models=None, scheduler=None):
+           symbols_to_fit=None, phase_models=None, scheduler=None,
+           phase_obj_callables=None,
+           phase_grad_callables=None,
+           phase_hess_callables=None,):
     """
     Returns the error from multiphase fitting as a log probability.
     """
     parameters = {param_name: param for param_name, param in zip(symbols_to_fit, params)}
     try:
         iter_error = multi_phase_fit(dbf, comps, phases, datasets, phase_models,
-                                     parameters=parameters, scheduler=scheduler)
+                                     parameters=parameters, scheduler=scheduler,
+                                     phase_obj_callables=phase_obj_callables,
+                                     phase_grad_callables=phase_grad_callables,
+                                     phase_hess_callables=phase_hess_callables,
+                                     )
     except (ValueError, LinAlgError) as e:
         iter_error = [np.inf]
     iter_error = [np.inf if np.isnan(x) else x ** 2 for x in iter_error]
@@ -222,6 +245,55 @@ def generate_parameter_distribution(parameters, num_samples, std_deviation, dete
     # apply a Gaussian random to each parameter with std dev of std_deviation*parameter
     tiled_parameters = np.tile(parameters, (num_samples, 1))
     return rng.normal(tiled_parameters, np.abs(tiled_parameters * std_deviation))
+
+
+def build_phase_models(dbf, comps, phases, symbols_to_fit, model):
+    """
+    Return dicts of phase models, and objective, gradient and hessian functions.
+
+    Parameters
+    ----------
+    dbf : Database
+        A pycalphad Database to fit with symbols to fit prefixed with `VV`
+        followed by a number, e.g. `VV0001`
+    comps : list
+        List of components to consider in the phases to (as strings)
+    phases : list
+        List of phase names to build
+    symbols_to_fit : list
+        List of symbol names to fit to
+    model : Model
+        pycalphad Model or CompiledModel
+
+    Returns
+    -------
+    tuple
+        4-tuple of phase models, objective, gradient and hessian function dicts
+
+    """
+    phase_models = dict()
+    if isinstance(model, CompiledModel):
+        # 0 is placeholder value
+        for phase_name in phases:
+            mod = CompiledModel(dbf, comps, phase_name, parameters=OrderedDict([(sympy.Symbol(s), 0) for s in symbols_to_fit]))
+            phase_models[phase_name] = mod
+        return phase_models, None, None, None
+    else:
+        # assume we have a Model or a subclass
+        obj_funcs = dict()
+        grad_funcs = dict()
+        hess_funcs = dict()
+        for phase_name in phases:
+            mod = Model(dbf, comps, phase_name)
+            obj, grad, hess = compiled_build_functions(mod.GM, [v.P, v.T] + mod.site_fractions,
+                                                       wrt=[v.P, v.T] + mod.site_fractions,
+                                                       parameters=[sympy.Symbol(s) for s in symbols_to_fit])
+            phase_models[phase_name] = mod
+            obj_funcs[phase_name] = obj
+            grad_funcs[phase_name] = grad
+            hess_funcs[phase_name] = hess
+        return phase_models, obj_funcs, grad_funcs, hess_funcs
+
 
 
 def mcmc_fit(dbf, datasets, mcmc_steps=1000, save_interval=100, chains_per_parameter=2,
@@ -289,21 +361,25 @@ def mcmc_fit(dbf, datasets, mcmc_steps=1000, save_interval=100, chains_per_param
         del dbf.symbols[x]
 
     # construct the models for each phase, substituting in the SymPy symbol to fit.
-    phase_models = dict()
+    model = Model
     logging.debug('Building phase models')
-    # 0 is placeholder value
-    phases = sorted(dbf.phases.keys())
-    for phase_name in phases:
-        mod = CompiledModel(dbf, comps, phase_name, parameters=OrderedDict([(sympy.Symbol(s), 0) for s in symbols_to_fit]))
-        phase_models[phase_name] = mod
-    logging.debug('Finished building phase models')
+    phases = list(dbf.phases.keys())
+    phase_models, obj_funcs, grad_funcs, hess_funcs = build_phase_models(dbf, comps, phases, symbols_to_fit, model)
     dbf = dask.delayed(dbf, pure=True)
+    obj_funcs = dask.delayed(obj_funcs, pure=True)
+    grad_funcs = dask.delayed(grad_funcs, pure=True)
+    hess_funcs = dask.delayed(hess_funcs, pure=True)
     phase_models = dask.delayed(phase_models, pure=True)
+    #dbf, obj_funcs, grad_funcs, hess_funcs, phase_models = scheduler.persist([dbf, obj_funcs, grad_funcs, hess_funcs, phase_models], broadcast=True)
+    logging.debug('Finished building phase models')
 
     # contect for the log probability function
     error_context = {'comps': comps, 'dbf': dbf,
                      'phases': phases, 'phase_models': phase_models,
                      'datasets': datasets, 'symbols_to_fit': symbols_to_fit,
+                     'phase_obj_callables': obj_funcs,
+                     'phase_grad_callables': grad_funcs,
+                     'phase_hess_callables': hess_funcs,
                      }
 
     def save_sampler_state(sampler):
